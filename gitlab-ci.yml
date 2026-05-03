@@ -1,0 +1,205 @@
+# ============================================================
+# Seguridad en Desarrollo Software — Actividad Práctica
+# Pipeline DevSecOps completo para GitLab CI/CD
+# Aplicación objetivo: DVWA (Damn Vulnerable Web Application)
+# ============================================================
+
+stages:
+  - test    # SAST y Detección de Secretos (análisis de código, sin despliegue)
+  - scan    # SonarCloud, Dependency Check y SCA (análisis de dependencias)
+  - dast    # DAST (análisis dinámico sobre la app en producción)
+
+# ── Variables globales del pipeline ──────────────────────────
+variables:
+  SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+  GIT_DEPTH: "0"
+  DAST_WEBSITE: "https://eipdss.000webhostapp.com/DVWA/"
+  DAST_AUTH_URL: "https://eipdss.000webhostapp.com/DVWA/login.php"
+  DAST_USERNAME_FIELD: "username"
+  DAST_PASSWORD_FIELD: "password"
+  DAST_SUBMIT_FIELD: "Login"
+  DAST_FULL_SCAN_ENABLED: "false"
+  DAST_AUTH_VERIFICATION_URL: "https://eipdss.000webhostapp.com/DVWA/index.php"
+
+# ── Inclusión de templates oficiales de GitLab ───────────────
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/DAST.gitlab-ci.yml
+  - template: Security/SAST.gitlab-ci.yml
+
+
+# ============================================================
+# STAGE: test
+# ============================================================
+
+# ── Job 1: Detección de Secretos (template GitLab) ───────────
+secret_detection:
+  stage: test
+  variables:
+    SECRET_DETECTION_HISTORIC_SCAN: "true"
+  artifacts:
+    when: always
+    reports:
+      secret_detection: gl-secret-detection-report.json
+    paths:
+      - gl-secret-detection-report.json
+    expire_in: 1 week
+  allow_failure: false
+
+
+# ── Job 2: SAST (template GitLab) ────────────────────────────
+sast:
+  stage: test
+  variables:
+    SAST_EXCLUDED_PATHS: "spec, test, tests, tmp"
+    SAST_DISABLE_BABEL: "true"
+  artifacts:
+    when: always
+    reports:
+      sast: gl-sast-report.json
+    paths:
+      - gl-sast-report.json
+    expire_in: 1 week
+
+
+# ── Job 3: SAST con Snyk [BONUS] ─────────────────────────────
+snyk-sast:
+  stage: test
+  image: snyk/snyk:php
+  variables:
+    SNYK_TOKEN: $SNYK_TOKEN
+  script:
+    - snyk auth $SNYK_TOKEN
+    - snyk test
+        --severity-threshold=high
+        --json-file-output=snyk-sast-report.json
+        || true
+    - snyk code test
+        --severity-threshold=high
+        --json-file-output=snyk-code-report.json
+        || true
+    - |
+      CRITICAL_COUNT=$(cat snyk-sast-report.json | \
+        python3 -c "import sys,json; d=json.load(sys.stdin); \
+        print(sum(1 for v in d.get('vulnerabilities',[]) \
+        if v.get('severity')=='critical'))" 2>/dev/null || echo "0")
+      if [ "$CRITICAL_COUNT" -gt "0" ]; then
+        echo "ERROR: $CRITICAL_COUNT critical vulnerabilities found by Snyk!"
+        exit 1
+      fi
+  artifacts:
+    when: always
+    paths:
+      - snyk-sast-report.json
+      - snyk-code-report.json
+    expire_in: 1 week
+  allow_failure: false
+  only:
+    - main
+    - merge_requests
+
+
+# ============================================================
+# STAGE: scan
+# ============================================================
+
+# ── Job 4: SonarCloud ────────────────────────────────────────
+sonarcloud-analysis:
+  stage: scan
+  image: sonarsource/sonar-scanner-cli:latest
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script:
+    - sonar-scanner
+        -Dsonar.projectKey=<TU_PROJECT_KEY>
+        -Dsonar.organization=<TU_ORGANIZATION>
+        -Dsonar.sources=.
+        -Dsonar.host.url=https://sonarcloud.io
+        -Dsonar.login=$SONAR_TOKEN
+        -Dsonar.qualitygate.wait=true
+  artifacts:
+    when: always
+    paths:
+      - .sonar/
+    expire_in: 1 week
+  allow_failure: false
+  only:
+    - main
+    - merge_requests
+
+
+# ── Job 5: OWASP Dependency Check ────────────────────────────
+dependency-check:
+  stage: scan
+  image:
+    name: owasp/dependency-check:latest
+    entrypoint: [""]
+  script:
+    - mkdir -p reports
+    - /usr/share/dependency-check/bin/dependency-check.sh
+        --project "${CI_PROJECT_NAME}"
+        --scan .
+        --format JSON
+        --format HTML
+        --out ./reports/
+        --failOnCVSS 9
+        --enableExperimental
+  artifacts:
+    when: always
+    paths:
+      - reports/dependency-check-report.json
+      - reports/dependency-check-report.html
+    expire_in: 1 week
+  allow_failure: false
+  cache:
+    paths:
+      - /usr/share/dependency-check/data/
+
+
+# ── Job 6: SCA — Dependency Scanning (template GitLab) ───────
+dependency_scanning:
+  stage: scan
+  variables:
+    DS_EXCLUDED_ANALYZERS: ""
+    SECURE_LOG_LEVEL: "info"
+  artifacts:
+    when: always
+    reports:
+      dependency_scanning: gl-dependency-scanning-report.json
+    paths:
+      - gl-dependency-scanning-report.json
+    expire_in: 1 week
+
+
+# ============================================================
+# STAGE: dast
+# ============================================================
+
+# ── Job 7: DAST con autenticación (template GitLab) ──────────
+dast:
+  stage: dast
+  variables:
+    DAST_WEBSITE: "https://eipdss.000webhostapp.com/DVWA/"
+    DAST_FULL_SCAN_ENABLED: "false"
+    DAST_AUTH_URL: "https://eipdss.000webhostapp.com/DVWA/login.php"
+    DAST_USERNAME: $DAST_USERNAME
+    DAST_PASSWORD: $DAST_PASSWORD
+    DAST_USERNAME_FIELD: "username"
+    DAST_PASSWORD_FIELD: "password"
+    DAST_SUBMIT_FIELD: "Login"
+    DAST_AUTH_VERIFICATION_URL: "https://eipdss.000webhostapp.com/DVWA/index.php"
+    DAST_ZAP_CLI_OPTIONS: "-config scanner.attackStrength=LOW"
+  artifacts:
+    when: always
+    reports:
+      dast: gl-dast-report.json
+    paths:
+      - gl-dast-report.json
+    expire_in: 1 week
+  allow_failure: false
